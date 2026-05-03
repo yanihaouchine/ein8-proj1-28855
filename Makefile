@@ -142,7 +142,7 @@ src/%.o: src/%.c src/thread.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 src/%.o: src/%.S
-	$(CC) $(MULTICORE_CFLAGS) $(MULTICORE_ASFLAGS) -c $< -o $@
+	$(CC) $(MULTICORE_CFLAGS) $(MULTICORE_ASFLAGS) $(STACK_FLAG) -c $< -o $@
 
 tests/%: tests/%.c $(LIB_NAME)
 	$(CC) $(CFLAGS) -Wno-unused-but-set-variable $< -o $@ -L. -lthread
@@ -169,12 +169,21 @@ pthreads: $(TEST_PTHREAD_BINS)
 tests/%-pthread: tests/%.c
 	$(CC) $(CFLAGS) -Wno-unused-but-set-variable -DUSE_PTHREAD $< -o $@ -lpthread
 
-check: all
+check:
+	$(MAKE) clean
+	$(MAKE) all
 	LD_LIBRARY_PATH=. ./scripts/run_tests.sh
+	$(MAKE) clean
+	$(MAKE) MULTICORE=1 all
+	LD_LIBRARY_PATH=. ./scripts/run_tests_mn.sh
 
-valgrind: clean
+valgrind:
+	$(MAKE) clean
 	$(MAKE) all EXTRA_CFLAGS="-mno-avx512f"
 	LD_LIBRARY_PATH=. ./scripts/run_valgrind.sh
+	$(MAKE) clean
+	$(MAKE) MULTICORE=1 all EXTRA_CFLAGS="-mno-avx512f"
+	LD_LIBRARY_PATH=. ./scripts/run_valgrind_mn.sh
 
 graphs: all pthreads
 	python3 scripts/generate_graphs.py

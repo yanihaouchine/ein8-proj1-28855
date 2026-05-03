@@ -15,7 +15,18 @@
 static void *stack_arena;
 static int stack_arena_next;
 
-static void *stack_free_head;
+/* Hidden (non-static) : thread_yield_asm consomme pending_dead_stack et
+ * pousse dans stack_free_head directement, évitant un wrapper C avec
+ * call/ret/endbr64 sur le hot path du yield. */
+__attribute__((visibility("hidden"))) void *stack_free_head;
+
+/* Stack du dernier thread qui a fait thread_exit, en attente de release.
+ * On ne peut pas la stack_release dans thread_exit car le thread courant
+ * y exécute encore le code jusqu'au context_restore — la libérer à ce
+ * moment permettrait à lazy_stack_alloc(next) de la réutiliser pour next,
+ * dont stack_init() écrirait au sommet de cette même pile.
+ * Le retour côté yield (post context_switch) la libère réellement. */
+__attribute__((visibility("hidden"))) void *pending_dead_stack;
 
 __attribute__((visibility("hidden"))) thread_hot_t  *hot_slab;
 __attribute__((visibility("hidden"))) thread_cold_t *cold_slab;
@@ -181,12 +192,7 @@ static void *stack_alloc(void)
     if (__builtin_expect(stack_arena_next >= STACK_CAP, 0))
         return NULL;
 
-    void *s = (char *)stack_arena + ((size_t)stack_arena_next++ * STACK_SIZE);
-    /* Page de garde sur la première utilisation du slot ; persiste à travers
-     * les recyclages via free list. */
-    if (__builtin_expect(mprotect(s, STACK_GUARD, PROT_NONE) != 0, 0))
-        perror("mprotect stack guard");
-    return s;
+    return (char *)stack_arena + ((size_t)stack_arena_next++ * STACK_SIZE);
 }
 
 static void stack_release(void *s)
@@ -477,10 +483,17 @@ __attribute__((visibility("default"))) int thread_yield(void)
         return 0;
     sigset_t old;
     preempt_block(&old);
+    /* thread_yield_asm consomme pending_dead_stack lui-même (cf. asm). */
     int r = thread_yield_asm();
     preempt_restore(&old);
     return r;
 }
+
+#else
+
+/* Mono sans préemption : alias `thread_yield = thread_yield_asm` posé dans
+ * context_switch.S. La consommation de pending_dead_stack est intégrée à
+ * l'asm pour éviter le coût call/ret + endbr64 du wrapper C. */
 
 #endif
 
@@ -685,6 +698,17 @@ __attribute__((visibility("default"), hot)) void thread_exit(void *retval)
     thread_hot_t *next = sched_pick_next();
 
     sched_remove(current);
+
+    /* Différer la release de notre stack : on l'utilise encore jusqu'au
+     * context_restore. La précédente pending_dead_stack (s'il y en a une,
+     * cas de deux thread_exit consécutifs sans yield au main) est libérée
+     * dès maintenant — son thread est mort, lazy_stack_alloc(next) peut la
+     * réutiliser sans risque. */
+    if (pending_dead_stack)
+        stack_release(pending_dead_stack);
+    pending_dead_stack = cc->stack_base;
+    cc->stack_base = NULL;
+
     current = next;
 
     if (__builtin_expect(next->rsp == NULL, 0))
