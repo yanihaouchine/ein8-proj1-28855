@@ -5,25 +5,69 @@ STACK_FLAG = $(if $(STACK_SIZE),-DSTACK_SIZE=$(STACK_SIZE),)
 EXTRA_CFLAGS ?=
 MULTICORE ?=
 
+# Détection de l'archi cible. Le hot path optimisé (asm context_switch,
+# pthread_setaffinity_np, MAP_POPULATE/MAP_STACK) n'est valide que sur
+# x86_64 + Linux + glibc — ailleurs on bascule sur le fallback ucontext
+# défini dans src/ctx_ucontext.c. La macro PORT_FAST_PATH (cf.
+# src/portable.h) reflète cette détection au niveau C.
+#
+# Override possible : `make PORT_FAST_PATH=0` force le fallback même sur
+# x86_64+Linux (utile pour tester la portabilité depuis la machine de dev).
+ifndef PORT_FAST_PATH
+ARCH := $(shell uname -m)
+KERNEL := $(shell uname -s)
+ifeq ($(ARCH)$(KERNEL),x86_64Linux)
+  PORT_FAST_PATH := 1
+else
+  PORT_FAST_PATH := 0
+endif
+endif
+
+ifeq ($(PORT_FAST_PATH),1)
+  LIB_SRC_S = src/context_switch.S
+  LIB_SRC_FALLBACK_C =
+  PORT_CFLAGS =
+else
+  LIB_SRC_S =
+  LIB_SRC_FALLBACK_C = src/ctx_ucontext.c
+  # _XOPEN_SOURCE=600 expose getcontext/makecontext/swapcontext (déprécié
+  # POSIX 2008 mais toujours présent sur glibc et macOS).
+  # PORT_FORCE_FALLBACK : signale au C qu'on veut le fallback même si
+  # __x86_64__/__linux__ sont définis (= test du fallback sur machine fast).
+  PORT_CFLAGS = -D_XOPEN_SOURCE=600 -DPORT_FORCE_FALLBACK
+endif
+
 ifeq ($(MULTICORE),1)
-  LIB_SRC_C       = src/thread_mn.c src/scheduler_mn.c src/thread_sync.c
+  LIB_SRC_C       = src/thread_mn.c src/scheduler_mn.c src/thread_sync.c $(LIB_SRC_FALLBACK_C)
   EXTRA_LDFLAGS   = -lpthread
   # USE_PREEMPTION dans CFLAGS permet à l'asm de NE PAS poser l'alias
   # thread_yield -> thread_yield_asm (notre C définit thread_yield).
-  # Mais MULTICORE désactive la préemption SIGALRM en C (la sched_stack
-  # n'aime pas être préemptée).
-  MULTICORE_CFLAGS = -DMULTICORE -DUSE_PREEMPTION
+  # LIBTHREAD_MN_PREEMPT activé par défaut : la préemption SIGALRM est
+  # robuste grâce à l'invariant "SIGALRM masqué sur sched_stack". Pour
+  # désactiver : make MULTICORE=1 EXTRA_CFLAGS=-DLIBTHREAD_MN_NO_PREEMPT.
+  ifeq ($(filter -DLIBTHREAD_MN_NO_PREEMPT,$(EXTRA_CFLAGS)),)
+    MULTICORE_CFLAGS = -DMULTICORE -DUSE_PREEMPTION -DLIBTHREAD_MN_PREEMPT
+  else
+    MULTICORE_CFLAGS = -DMULTICORE -DUSE_PREEMPTION
+  endif
   MULTICORE_ASFLAGS =
 else
-  LIB_SRC_C       = src/thread.c src/thread_sync.c
+  LIB_SRC_C       = src/thread.c src/thread_sync.c $(LIB_SRC_FALLBACK_C)
   EXTRA_LDFLAGS   =
   MULTICORE_CFLAGS =
   MULTICORE_ASFLAGS =
 endif
 
-CFLAGS  = -Wall -Wextra -Werror -g -Ofast -flto -fPIC -fvisibility=hidden -march=native -mtune=native -fno-plt -DNDEBUG -I./src $(VALGRIND_FLAG) $(STACK_FLAG) $(MULTICORE_CFLAGS) $(EXTRA_CFLAGS)
+# -march=native est gardé seulement sur fast path (x86_64). Sur fallback,
+# on laisse le compilateur choisir un baseline portable.
+ifeq ($(PORT_FAST_PATH),1)
+  ARCH_CFLAGS = -march=native -mtune=native -fno-plt
+else
+  ARCH_CFLAGS =
+endif
 
-LIB_SRC_S = src/context_switch.S
+CFLAGS  = -Wall -Wextra -Werror -g -Ofast -flto -fPIC -fvisibility=hidden $(ARCH_CFLAGS) -DNDEBUG -I./src $(PORT_CFLAGS) $(VALGRIND_FLAG) $(STACK_FLAG) $(MULTICORE_CFLAGS) $(EXTRA_CFLAGS)
+
 LIB_OBJ   = $(LIB_SRC_C:.c=.o) $(LIB_SRC_S:.S=.o)
 LIB_NAME = libthread.so
 
@@ -32,7 +76,7 @@ LIB_NAME = libthread.so
 # AVANT que make ne décide quoi recompiler. Sans ça, context_switch.o (compilé
 # sans MULTICORE_CFLAGS) garde l'alias thread_yield -> thread_yield_asm et
 # entre en collision avec le thread_yield C de thread_mn.c.
-BUILD_VARIANT := $(if $(MULTICORE_CFLAGS),mn,mono)
+BUILD_VARIANT := $(if $(MULTICORE_CFLAGS),mn,mono)-$(if $(filter 1,$(PORT_FAST_PATH)),fast,fallback)
 BUILD_STAMP   := src/.build-variant
 PREV_VARIANT  := $(shell cat $(BUILD_STAMP) 2>/dev/null)
 ifneq ($(PREV_VARIANT),$(BUILD_VARIANT))

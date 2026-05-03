@@ -127,7 +127,7 @@ __attribute__((cold)) static void mem_init(void)
         exit(1);
     }
 
-    madvise(stack_arena, (size_t)STACK_CAP * STACK_SIZE, MADV_HUGEPAGE);
+    PORT_MADV_HUGEPAGE(stack_arena, (size_t)STACK_CAP * STACK_SIZE);
     hot_slab = mmap(NULL, (size_t)THREAD_CAP * sizeof(thread_hot_t), PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (__builtin_expect(hot_slab == MAP_FAILED, 0))
@@ -215,8 +215,16 @@ static void thread_release(thread_hot_t *t)
     thread_free_head = t;
 }
 
+/* Pile de sortie pré-armée : context_restore(exit_rsp) déroule jusqu'à
+ * clean_exit() quand le dernier thread termine. clean_exit() appelle
+ * mem_destroy() qui munmap la stack arena — d'où la nécessité d'une pile
+ * indépendante. Sur fallback, la même pile sert de support à un ucontext_t
+ * d'exit (taille augmentée pour loger ucontext_t + appels exit handlers). */
+#if PORT_FAST_PATH
 static char exit_stack[4096] __attribute__((aligned(16)));
-
+#else
+static char exit_stack[16 * 1024] __attribute__((aligned(16)));
+#endif
 static void *exit_rsp;
 
 __attribute__((visibility("hidden"))) void thread_entry(void *(*func)(void *), void *arg)
@@ -232,6 +240,7 @@ static int stack_color_counter;
 
 static void *stack_init(void *stack_base, void *(*func)(void *), void *arg)
 {
+#if PORT_FAST_PATH
     uintptr_t sp = (uintptr_t)stack_base + STACK_SIZE;
 
     sp -= ((unsigned)stack_color_counter++ & 0xFF) * 64;
@@ -253,9 +262,17 @@ static void *stack_init(void *stack_base, void *(*func)(void *), void *arg)
     VALGRIND_MAKE_MEM_DEFINED(s, 7 * sizeof(void *));
 
     return s;
+#else
+    /* Fallback : pas de pose manuelle de registres callee-saved sur la pile.
+     * port_make_ctx alloue un ucontext_t juste après la guard page et l'arme
+     * pour appeler thread_entry(func, arg). Le `void *` retourné est en fait
+     * un `ucontext_t *` opaque. */
+    (void)stack_color_counter;
+    return port_make_ctx(stack_base, func, arg);
+#endif
 }
 
-__attribute__((cold)) static void clean_exit(void)
+__attribute__((cold, __noreturn__)) static void clean_exit(void)
 {
     thread_cold_t *cc = THREAD_COLD(current);
     if (cc->stack_base)
@@ -322,6 +339,7 @@ __attribute__((constructor, cold)) static void init_system(void)
     thread_cold_reset(cc);
     cc->started = 1;  /* main tourne déjà */
 
+#if PORT_FAST_PATH
     uintptr_t sp = (uintptr_t)(exit_stack + sizeof(exit_stack));
     sp &= ~(uintptr_t)0xF;
     void **s = (void **)sp;
@@ -334,6 +352,9 @@ __attribute__((constructor, cold)) static void init_system(void)
     *(--s) = 0;
     exit_rsp = s;
     VALGRIND_MAKE_MEM_DEFINED(s, 7 * sizeof(void *));
+#else
+    exit_rsp = port_make_simple_ctx(exit_stack, sizeof(exit_stack), clean_exit);
+#endif
 
     preempt_init();
 }
